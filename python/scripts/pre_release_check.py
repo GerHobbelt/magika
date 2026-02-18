@@ -27,14 +27,49 @@ import magika
 
 
 @click.command()
-@click.argument("expected_version")
+@click.option(
+    "--expected-version",
+    default="",
+    help="Expected version string (e.g., '1.2.3'). If provided, checks will be validated against this value.",
+)
+@click.option(
+    "--report-only",
+    is_flag=True,
+    help="Print errors without failing. (Default: Fails on errors)",
+)
+@click.option(
+    "--check-pip-show-package-version/--no-check-pip-show-package-version",
+    is_flag=True,
+    default=True,
+    help="Enable/disable version check via 'pip show'. (Default: Enabled)",
+)
 @click.option(
     "--use-python-client",
     is_flag=True,
-    help="Use the Python client instead of Rust CLI.",
+    help="Use the Python client instead of Rust client. (Default: False)",
 )
-def main(expected_version: str, use_python_client: bool) -> None:
-    """Checks version consistency for the `magika` package."""
+def main(
+    expected_version: str,
+    report_only: bool,
+    check_pip_show_package_version: bool,
+    use_python_client: bool,
+) -> None:
+    """Checks versions consistency for the `magika` package."""
+
+    if report_only:
+        click.echo('Running in "report only" mode.')
+    if not check_pip_show_package_version:
+        click.echo("Skipping checking package version via pip show.")
+    if use_python_client:
+        click.echo("Using python client instead of Rust client.")
+
+    strict_mode = not report_only
+    if strict_mode:
+        if expected_version == "":
+            click.secho(
+                "ERROR: when not using --report-only, --expected-version is required."
+            )
+            sys.exit(1)
 
     with_errors = False
 
@@ -45,7 +80,10 @@ def main(expected_version: str, use_python_client: bool) -> None:
     except Exception:
         instance_version = ""
 
-    package_version = get_magika_package_version_via_pip_show()
+    if check_pip_show_package_version:
+        pip_show_package_version = get_magika_package_version_via_pip_show()
+    else:
+        pip_show_package_version = ""
 
     if use_python_client:
         cli_version = instance_version
@@ -58,18 +96,18 @@ def main(expected_version: str, use_python_client: bool) -> None:
     if instance_version == "":
         click.echo("ERROR: failed to get instance_version.")
         with_errors = True
-    if package_version == "":
-        click.echo("ERROR: failed to get package_version.")
+    if check_pip_show_package_version and pip_show_package_version == "":
+        click.echo("ERROR: failed to get pip_show_package_version.")
         with_errors = True
     if cli_version == "":
         click.echo("ERROR: failed to get cli_version.")
         with_errors = True
 
     click.echo(
-        f"Versions: {expected_version=}, {module_version=}, {instance_version=}, {package_version=}, {cli_version=}"
+        f"Extracted versions: {expected_version=}, {module_version=}, {instance_version=}, {pip_show_package_version=}, {cli_version=}."
     )
 
-    if module_version != expected_version:
+    if expected_version != "" and module_version != expected_version:
         click.echo(f"ERROR: {module_version=} != {expected_version=}")
         with_errors = True
 
@@ -77,15 +115,16 @@ def main(expected_version: str, use_python_client: bool) -> None:
         click.echo(f"ERROR: {instance_version=} != {module_version=}")
         with_errors = True
 
-    if module_version != package_version:
-        click.echo(f"ERROR: {module_version=} != {package_version=}")
-        with_errors = True
+    if check_pip_show_package_version:
+        if module_version != pip_show_package_version:
+            click.echo(f"ERROR: {module_version=} != {pip_show_package_version=}")
+            with_errors = True
 
     # From now on, we assume all the python-related versions are the same. If
     # they are not, we would have at least one error above.
 
     if not is_valid_python_version(module_version):
-        click.echo(f"ERROR: {module_version=} is not a valid python version")
+        click.echo(f"ERROR: {module_version=} is not a valid python version.")
         with_errors = True
 
     if module_version.endswith("-dev") or cli_version.endswith("-dev"):
@@ -97,10 +136,11 @@ def main(expected_version: str, use_python_client: bool) -> None:
         with_errors = True
 
     if with_errors:
-        click.echo("There was at least one error")
-        sys.exit(1)
+        click.secho("There was at least one error.", fg="red")
+        if strict_mode:
+            sys.exit(1)
     else:
-        click.echo("All tests pass!")
+        click.secho("All tests pass!", fg="green")
 
 
 def get_rust_cli_version() -> str:
@@ -133,7 +173,7 @@ def get_magika_package_version_via_pip_show() -> str:
             if line.startswith("Version: "):
                 return line.split(": ", 1)[1]
         click.echo(
-            f"ERROR: Could not extract the package version via pip show. Output from pip show: {r.stdout}"
+            f"ERROR: Could not extract the package version via pip show. Output from pip show:\nstdout={r.stdout}\n\nstderr={r.stderr}"
         )
         return ""
     except subprocess.CalledProcessError as e:
