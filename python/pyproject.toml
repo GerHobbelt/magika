@@ -32,7 +32,7 @@ classifiers = [
     "Topic :: Software Development",
     "Typing :: Typed",
 ]
-version = "1.0.2.dev0"
+version = "1.0.2"
 
 dependencies = [
     "click>=8.1.7",
@@ -50,8 +50,6 @@ dependencies = [
 
     # Windows-specific cap for older Python versions (Ensure this is intentional!)
     "onnxruntime<=1.20.1 ; sys_platform == 'win32' and python_version < '3.13'",
-
-    "python-dotenv>=1.0.1",
 ]
 
 
@@ -69,16 +67,20 @@ dev = [
     "ipython>=8.12.3",
     "pytest>=8.3.2",
     "ruff>=0.14.0",
-    "twine==6.1.0",
     "tomli-w>=1.0.0",
     "tomli>=2.0.1",
     "tqdm>=4.67.1",
     "dacite>=1.9.2",
+    "requests>=2.32.4",
 ]
 
 [build-system]
-requires = ["maturin>=1.7,<=1.10.2"] # Pinned to avoid a potential regression in newer versions.
+requires = ["maturin>=1.12.2"]
 build-backend = "maturin"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
 
 [tool.maturin]
 python-source = "src"
