@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2-dev
+
+### Patch
+
+- Update dependencies
+- Enable full LTO for the release profile
+
 ## 1.0.1
 
 ### Patch
