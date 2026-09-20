@@ -39,7 +39,7 @@ info "Test against the test suites: $TEST_SUITES"
   done
 )
 
-# We rely below on the fact that we don't have permission to read `chmod 000` files.
+# We rely below on the fact that we don't have permission on /etc/shadow.
 [ $(id -u) -eq 0 ] && success "No more tests in Docker"
 
 info "Test exit code with at least one error"
@@ -53,15 +53,28 @@ test_error() {
     [ "$actual" = "$expected" ] || error "invalid output for magika $files"
   )
 }
-unreadable=$(mktemp)
-trap 'chmod u+rw "$unreadable"; rm -f "$unreadable"' EXIT
-chmod 000 "$unreadable"
-test_error "$unreadable" "\
-$unreadable: Permission denied (os error 13) (error)"
+[ "$(uname -s)" = Linux ] && test_error '/etc/shadow' "\
+/etc/shadow: Permission denied (os error 13) (error)"
 test_error 'non_existent src/main.rs' "\
 non_existent: No such file or directory (os error 2) (error)
 src/main.rs: Rust source (code)"
 
+info "Test directory cycles"
+( dir=$(mktemp -d)
+  trap "rm -rf $dir" EXIT
+  mkdir -p $dir/tree/sub
+  touch $dir/tree/empty
+  ln -s .. $dir/tree/sub/back
+  ln -s tree $dir/sibling
+  test_error "-r $dir" "\
+$dir/sibling/empty: Empty file (inode)
+$dir/sibling/sub/back: Directory cycle (error)
+$dir/tree/empty: Empty file (inode)
+$dir/tree/sub/back: Directory cycle (error)"
+)
+
 info "Test exit code with broken pipe"
 magika -r ../../tests_data | head -n1 >/dev/null
 [ "${PIPESTATUS[0]}" -eq 0 ] || error "non-zero exit code with broken pipe"
+
+success "Exit shell"

@@ -13,12 +13,10 @@
 // limitations under the License.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::io::{ErrorKind, Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use anyhow::{ensure, Result};
@@ -306,32 +304,24 @@ fn main() -> Result<()> {
         None => default_inference_threads(runtime.backend_info().backend()),
     };
     let readers = flags.experimental.readers;
-    let (work_sender, work_receiver) = crossbeam_channel::bounded::<OrderPath>(readers);
+    let (work_sender, work_receiver) = crossbeam_channel::bounded::<Pending>(readers);
     let (read_sender, read_receiver) =
         std::sync::mpsc::sync_channel::<ReadItem>(threads * batch_size);
-    let (batch_sender, batch_receiver) = crossbeam_channel::bounded::<InferenceBatch>(threads);
+    let (batch_sender, batch_receiver) = crossbeam_channel::bounded::<Vec<BatchItem>>(threads);
     let (result_sender, result_receiver) =
         std::sync::mpsc::sync_channel::<Result<Response>>(threads * batch_size);
-    let reorder_next = Arc::new(AtomicUsize::new(0));
     #[cfg(feature = "_trace")]
     let trace = Trace::default();
     let mut join_handles = Vec::new();
     join_handles.push(std::thread::Builder::new().name("magika-walk".to_string()).spawn({
         let flags = flags.clone();
         let result_sender = result_sender.clone();
-        let reorder_next = reorder_next.clone();
         #[cfg(feature = "_trace")]
         let trace = trace.clone();
         move || {
             #[cfg(feature = "_trace")]
             let start = Stage::start();
-            if let Err(e) = walk_paths(
-                &flags,
-                &work_sender,
-                &result_sender,
-                &reorder_next,
-                4 * threads * batch_size,
-            ) {
+            if let Err(e) = walk_paths(&flags, &work_sender, &result_sender) {
                 let _ = result_sender.send(Err(e));
             }
             #[cfg(feature = "_trace")]
@@ -397,7 +387,7 @@ fn main() -> Result<()> {
     }
     drop(batch_receiver);
     drop(result_sender);
-    let print_result = match print(&flags, result_receiver, reorder_next) {
+    let print_result = match print(&flags, result_receiver) {
         Err(e)
             if e.root_cause()
                 .downcast_ref::<std::io::Error>()
@@ -417,20 +407,19 @@ fn main() -> Result<()> {
 
 fn print(
     flags: &Flags, result_receiver: std::sync::mpsc::Receiver<Result<Response>>,
-    reorder_next: Arc<AtomicUsize>,
 ) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     if flags.format.json {
         write!(stdout, "[")?;
     }
-    let mut reorder = Reorder::new(reorder_next);
+    let mut reorder = Reorder::default();
     let mut errors = false;
     while let Ok(response) = result_receiver.recv() {
         reorder.push(response?);
         while let Some(response) = reorder.pop() {
             errors |= response.result.is_err();
             if flags.format.json {
-                if reorder.next.load(Relaxed) != 1 {
+                if reorder.next != 1 {
                     write!(stdout, ",")?;
                 }
                 for line in serde_json::to_string_pretty(&response.json()?)?.lines() {
@@ -443,7 +432,7 @@ fn print(
     }
     debug_assert!(reorder.is_empty());
     if flags.format.json {
-        if reorder.next.load(Relaxed) != 0 {
+        if reorder.next != 0 {
             writeln!(stdout)?;
         }
         writeln!(stdout, "]")?;
@@ -459,24 +448,17 @@ fn print(
 /// This task only traverses and stats. Reading file content is left to [`read_files`] so that it
 /// happens on several threads at once instead of serializing behind traversal.
 fn walk_paths(
-    flags: &Flags, work_sender: &crossbeam_channel::Sender<OrderPath>,
-    result_sender: &std::sync::mpsc::SyncSender<Result<Response>>, reorder_next: &AtomicUsize,
-    max_dist: usize,
+    flags: &Flags, work_sender: &crossbeam_channel::Sender<Pending>,
+    result_sender: &std::sync::mpsc::SyncSender<Result<Response>>,
 ) -> Result<()> {
-    let mut flags_paths: Vec<(PathBuf, Option<std::fs::FileType>)> =
-        flags.path.iter().rev().map(|path| (path.clone(), None)).collect();
+    let mut traversal = Traversal::new(&flags.path);
     let mut order = 0;
-    while let Some((path, file_type)) = flags_paths.pop() {
-        let processed = process_path(flags, &mut flags_paths, &path, file_type);
+    while let Some((path, file_type)) = traversal.pop() {
+        let processed = process_path(flags, &mut traversal, &path, file_type);
         if matches!(processed, Ok(ProcessPath::Recursive)) {
             continue;
         }
-        // Make sure a specific non-recursive path does not get stranded for too long in the
-        // pipeline. This bounds the reorder buffer without starving the pipeline.
-        while reorder_next.load(Relaxed) + max_dist < order {
-            std::hint::spin_loop();
-        }
-        let pending = OrderPath { order, path };
+        let pending = Pending { order, path };
         match processed {
             Ok(ProcessPath::Content) => work_sender.send(pending)?,
             Ok(ProcessPath::Ruled(file_type)) => {
@@ -497,7 +479,7 @@ fn walk_paths(
 /// on a dedicated thread costs a system call per block instead, and there is nothing else for the
 /// thread to interleave anyway.
 fn read_files(
-    work_receiver: &crossbeam_channel::Receiver<OrderPath>,
+    work_receiver: &crossbeam_channel::Receiver<Pending>,
     sender: &std::sync::mpsc::SyncSender<ReadItem>,
 ) {
     while let Ok(pending) = work_receiver.recv() {
@@ -511,15 +493,17 @@ fn read_files(
 /// Accumulates every reader's output into one global inference batch stream.
 fn batch_files(
     batch_size: usize, receiver: &std::sync::mpsc::Receiver<ReadItem>,
-    batch_sender: &crossbeam_channel::Sender<InferenceBatch>,
+    batch_sender: &crossbeam_channel::Sender<Vec<BatchItem>>,
     result_sender: &std::sync::mpsc::SyncSender<Result<Response>>,
 ) -> Result<()> {
-    let mut batcher = Batcher::new(batch_size);
+    let mut batch = Vec::with_capacity(batch_size);
     while let Ok(ReadItem { pending, extracted }) = receiver.recv() {
         match extracted {
             Ok(FeaturesOrRuled::Features(features)) => {
-                if let Some(batch) = batcher.push(pending, features) {
-                    batch_sender.send(batch)?;
+                batch.push(BatchItem { pending, features });
+                if batch.len() == batch_size {
+                    let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+                    batch_sender.send(full)?;
                 }
             }
             Ok(FeaturesOrRuled::Ruled(content_type)) => {
@@ -531,7 +515,7 @@ fn batch_files(
             }
         }
     }
-    if let Some(batch) = batcher.finish() {
+    if !batch.is_empty() {
         batch_sender.send(batch)?;
     }
     Ok(())
@@ -553,19 +537,61 @@ enum ProcessPath {
     Ruled(FileType),
 }
 
-struct OrderPath {
+struct Pending {
     order: usize,
     path: PathBuf,
 }
 
 struct ReadItem {
-    pending: OrderPath,
+    pending: Pending,
     extracted: Result<FeaturesOrRuled>,
 }
 
+struct BatchItem {
+    pending: Pending,
+    features: Features,
+}
+
+/// A path still to process, or the point where traversal leaves a directory.
+enum WalkEntry {
+    Path(PathBuf, Option<std::fs::FileType>),
+    LeaveDirectory(PathBuf),
+}
+
+const DIRECTORY_CYCLE: &str = "Directory cycle";
+
+struct Traversal {
+    pending: Vec<WalkEntry>,
+    ancestors: HashSet<PathBuf>,
+}
+
+impl Traversal {
+    fn new(paths: &[PathBuf]) -> Self {
+        let pending = paths.iter().rev().map(|path| WalkEntry::Path(path.clone(), None)).collect();
+        let ancestors = HashSet::new();
+        Traversal { pending, ancestors }
+    }
+
+    fn push(&mut self, path: &Path) -> Result<()> {
+        let canonical = std::fs::canonicalize(path)?;
+        ensure!(self.ancestors.insert(canonical.clone()), DIRECTORY_CYCLE);
+        self.pending.push(WalkEntry::LeaveDirectory(canonical));
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<(PathBuf, Option<std::fs::FileType>)> {
+        while let Some(entry) = self.pending.pop() {
+            match entry {
+                WalkEntry::Path(path, kind) => return Some((path, kind)),
+                WalkEntry::LeaveDirectory(path) => drop(self.ancestors.remove(&path)),
+            }
+        }
+        None
+    }
+}
+
 fn process_path(
-    flags: &Flags, paths: &mut Vec<(PathBuf, Option<std::fs::FileType>)>, path: &Path,
-    known: Option<std::fs::FileType>,
+    flags: &Flags, traversal: &mut Traversal, path: &Path, known: Option<std::fs::FileType>,
 ) -> Result<ProcessPath> {
     if path.to_str() == Some("-") {
         return Ok(ProcessPath::Content);
@@ -585,14 +611,15 @@ fn process_path(
     };
     if metadata.is_dir() {
         return Ok(if flags.recursive {
+            traversal.push(path)?;
             let mut dir_paths = Vec::new();
             for entry in std::fs::read_dir(path)? {
                 let entry = entry?;
                 dir_paths.push((entry.path(), entry.file_type().ok()));
             }
             dir_paths.sort_by(|a, b| a.0.cmp(&b.0));
-            while let Some(path) = dir_paths.pop() {
-                paths.push(path);
+            while let Some((path, kind)) = dir_paths.pop() {
+                traversal.pending.push(WalkEntry::Path(path, kind));
             }
             ProcessPath::Recursive
         } else {
@@ -606,90 +633,48 @@ fn process_path(
 }
 
 fn infer_batches(
-    runtime: &Runtime, receiver: &crossbeam_channel::Receiver<InferenceBatch>,
+    runtime: &Runtime, receiver: &crossbeam_channel::Receiver<Vec<BatchItem>>,
     sender: &std::sync::mpsc::SyncSender<Result<Response>>,
 ) -> Result<()> {
     // Create a session only when a thread receives its first batch. A short run never reaches most
     // threads, so spawning their private execution state up front would be pure startup overhead.
     let mut session = None;
-    while let Ok(InferenceBatch { pending, features }) = receiver.recv() {
+    while let Ok(batch) = receiver.recv() {
         let magika = match &mut session {
             Some(session) => session,
             slot => slot.insert(runtime.session()?),
         };
-        let batch = magika.identify_features_batch(&features)?;
-        debug_assert_eq!(batch.len(), pending.len());
-        for (pending, output) in pending.into_iter().zip(batch) {
+        let results = magika.identify_features_batch(batch.iter().map(|x| &x.features))?;
+        debug_assert_eq!(results.len(), batch.len());
+        for (item, output) in batch.into_iter().zip(results) {
             let result = Ok(output);
-            sender.send(Ok(Response::new(pending, result)))?;
+            sender.send(Ok(Response::new(item.pending, result)))?;
         }
     }
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Reorder {
-    next: Arc<AtomicUsize>,
+    next: usize,
     todo: HashMap<usize, Response>,
 }
 
 impl Reorder {
-    fn new(next: Arc<AtomicUsize>) -> Self {
-        Reorder { next, todo: HashMap::new() }
-    }
-
     fn is_empty(&self) -> bool {
         self.todo.is_empty()
     }
 
     fn push(&mut self, response: Response) {
-        debug_assert!(self.next.load(Relaxed) <= response.order);
+        debug_assert!(self.next <= response.order);
         let prev = self.todo.insert(response.order, response);
         debug_assert!(prev.is_none());
     }
 
     fn pop(&mut self) -> Option<Response> {
-        let result = self.todo.remove(&self.next.load(Relaxed))?;
-        self.next.fetch_add(1, Relaxed);
+        let result = self.todo.remove(&self.next)?;
+        self.next += 1;
         Some(result)
-    }
-}
-
-struct InferenceBatch {
-    pending: Vec<OrderPath>,
-    features: Vec<Features>,
-}
-
-struct Batcher {
-    batch_size: usize,
-    pending: Vec<OrderPath>,
-    features: Vec<Features>,
-}
-
-impl Batcher {
-    fn new(batch_size: usize) -> Self {
-        Self {
-            batch_size,
-            pending: Vec::with_capacity(batch_size),
-            features: Vec::with_capacity(batch_size),
-        }
-    }
-
-    fn push(&mut self, pending: OrderPath, features: Features) -> Option<InferenceBatch> {
-        self.pending.push(pending);
-        self.features.push(features);
-        (self.features.len() == self.batch_size).then(|| self.take())
-    }
-
-    fn finish(mut self) -> Option<InferenceBatch> {
-        (!self.features.is_empty()).then(|| self.take())
-    }
-
-    fn take(&mut self) -> InferenceBatch {
-        InferenceBatch {
-            pending: std::mem::replace(&mut self.pending, Vec::with_capacity(self.batch_size)),
-            features: std::mem::replace(&mut self.features, Vec::with_capacity(self.batch_size)),
-        }
     }
 }
 
@@ -701,7 +686,7 @@ struct Response {
 }
 
 impl Response {
-    fn new(pending: OrderPath, result: Result<FileType>) -> Self {
+    fn new(pending: Pending, result: Result<FileType>) -> Self {
         Self { order: pending.order, path: pending.path, result }
     }
 }
@@ -712,6 +697,7 @@ enum JsonError {
     Unknown,
     FileDoesNotExist,
     PermissionError,
+    DirectoryCycle,
 }
 
 #[derive(Serialize)]
@@ -723,14 +709,17 @@ struct JsonResult<'a> {
 
 impl From<anyhow::Error> for JsonError {
     fn from(value: anyhow::Error) -> Self {
-        match value.root_cause().downcast_ref::<std::io::Error>() {
-            Some(x) => match x.kind() {
-                ErrorKind::NotFound => JsonError::FileDoesNotExist,
-                ErrorKind::PermissionDenied => JsonError::PermissionError,
-                _ => JsonError::Unknown,
-            },
-            _ => JsonError::Unknown,
+        if let Some(x) = value.root_cause().downcast_ref::<std::io::Error>() {
+            match x.kind() {
+                ErrorKind::NotFound => return JsonError::FileDoesNotExist,
+                ErrorKind::PermissionDenied => return JsonError::PermissionError,
+                _ => (),
+            }
         }
+        if value.to_string() == DIRECTORY_CYCLE {
+            return JsonError::DirectoryCycle;
+        }
+        JsonError::Unknown
     }
 }
 
