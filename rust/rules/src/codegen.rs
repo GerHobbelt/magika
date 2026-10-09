@@ -17,7 +17,7 @@ use crate::RuleInfo;
 pub(crate) fn rule_set(program: &Program, labels: &[String], rules: &[RuleInfo]) -> String {
     let mut out = String::from(
         "{\n    use crate::ir::{Cmp, Cond as C, Int as I, Read};\n    \
-         use crate::matcher::{Pattern, RegexPattern};\n    \
+         use crate::matcher::{ByteSet, Pattern, RegexPattern};\n    \
          use crate::{Class, RuleInfo};\n    \
          crate::RuleSet {\n        program: crate::ir::Program {\n            patterns: vec![\n",
     );
@@ -29,8 +29,12 @@ pub(crate) fn rule_set(program: &Program, labels: &[String], rules: &[RuleInfo])
             }
             Pattern::Regex(regex) => write!(
                 out,
-                "Pattern::Regex(RegexPattern::new({:?}, {}, {}, {}))",
-                regex.source, regex.case_insensitive, regex.dot_matches_new_line, regex.max_len
+                "Pattern::Regex(RegexPattern::new({:?}, {}, {}, {}, ByteSet({:#x?})))",
+                regex.source,
+                regex.case_insensitive,
+                regex.dot_matches_new_line,
+                regex.max_len,
+                regex.first.0,
             ),
         }
         .unwrap();
@@ -43,7 +47,12 @@ pub(crate) fn rule_set(program: &Program, labels: &[String], rules: &[RuleInfo])
         cond(&mut out, &rule.cond);
         out.push_str(" },\n");
     }
-    out.push_str("            ],\n        },\n        labels: vec![\n");
+    writeln!(
+        out,
+        "            ],\n            facts: {},\n        }},\n        labels: vec![",
+        program.facts
+    )
+    .unwrap();
     for label in labels {
         writeln!(out, "            {label:?}.to_string(),").unwrap();
     }
@@ -107,6 +116,11 @@ fn cond(out: &mut String, cond: &Cond) {
             int(out, hi);
             out.push_str(" }");
         }
+        Cond::View { view, text, start } => write!(
+            out,
+            "C::View {{ view: crate::ir::View::{view:?}, text: vec!{text:?}, start: {start} }}"
+        )
+        .unwrap(),
     }
 }
 
@@ -120,6 +134,7 @@ fn int(out: &mut String, int: &Int) {
             self::int(out, at);
             out.push_str("))");
         }
+        Int::Fact(fact) => write!(out, "I::Fact(crate::ir::Fact::{fact:?})").unwrap(),
         Int::And(a, b) => {
             out.push_str("I::And(Box::new(");
             self::int(out, a);
