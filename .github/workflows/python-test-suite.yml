@@ -13,6 +13,7 @@ on:
       - "python/**"
       - "rust/**"
       - "tests_data/**"
+      - ".github/actions/rust-cache/**"
       - ".github/workflows/python-test-suite.yml"
 
 permissions:
@@ -41,8 +42,11 @@ jobs:
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/${{ env.UV_VERSION }}/install.sh | sh
 
+      - name: Cache Rust build
+        uses: ./.github/actions/rust-cache
+
       - name: Build and stage magika CLI binary
-        run: ./python/scripts/stage_cli.sh
+        run: ./python/scripts/build_and_stage_cli.sh
 
       - name: Install all projects dependencies (with the requested python version)
         working-directory: python
